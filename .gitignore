@@ -1,0 +1,47 @@
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+!frontend/.env.demo
+frontend/coverage/
+frontend/.vite/
+
+# Backend
+backend/target/
+target/
+backend/data/
+backend/uploads/
+uploads/
+backend/.env
+backend/.env.*
+!backend/.env.example
+backend/*.log
+backend/hs_err_pid*
+
+# Local verification output
+artifacts/
+graphify-out/
+STAGE*_REPORT.md
+PROJECT_AUDIT.md
+scripts/__pycache__/
+.graphify_manifest_*.png
+select_preview.png
+playwright-report/
+test-results/
+coverage/
+*.log
+*.tmp
+*.swp
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.env
+.railway/
+*.iml
+*.ipr
+*.iws

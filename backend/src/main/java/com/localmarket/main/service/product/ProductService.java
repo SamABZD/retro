@@ -1,0 +1,954 @@
+package com.localmarket.main.service.product;
+
+import com.localmarket.main.entity.category.Category;
+import com.localmarket.main.entity.product.Product;
+import com.localmarket.main.entity.user.User;
+import com.localmarket.main.repository.category.CategoryRepository;
+import com.localmarket.main.repository.product.ProductRepository;
+import com.localmarket.main.repository.user.UserRepository;
+import com.localmarket.main.security.ProducerOnly;
+import com.localmarket.main.dto.product.ProductRequest;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.Optional;
+import org.springframework.dao.DataIntegrityViolationException;
+import com.localmarket.main.exception.ApiException;
+import com.localmarket.main.exception.ErrorType;
+
+import com.localmarket.main.dto.product.ProductResponse;
+import java.math.BigDecimal;
+import java.util.Map;
+import com.localmarket.main.dto.product.ProducerProductsResponse;
+import com.localmarket.main.dto.user.FilterUsersResponse;
+import com.localmarket.main.service.notification.producer.ProducerNotificationService;
+import com.localmarket.main.service.storage.FileStorageService;
+import org.springframework.web.multipart.MultipartFile;
+import com.localmarket.main.entity.product.ProductStatus;
+import com.localmarket.main.entity.product.ListingCondition;
+import com.localmarket.main.entity.product.ListingStatus;
+import com.localmarket.main.dto.product.MyProductResponse;
+import com.localmarket.main.entity.product.StockReservation;
+import com.localmarket.main.repository.product.StockReservationRepository;
+import org.springframework.scheduling.annotation.Scheduled;
+import java.time.LocalDateTime;
+import com.localmarket.main.entity.order.Order;
+import com.localmarket.main.entity.order.OrderItem;
+import com.localmarket.main.dto.notification.NotificationResponse;
+import com.localmarket.main.dto.review.VerifiedReviews;
+import com.localmarket.main.repository.review.ReviewRepository;
+import com.localmarket.main.repository.order.OrderItemRepository;
+import com.localmarket.main.entity.review.ReviewStatus;
+import com.localmarket.main.entity.review.Review;
+import com.localmarket.main.service.notification.admin.AdminNotificationService;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.net.URI;
+import java.net.URISyntaxException;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class ProductService {
+    private final ProductRepository productRepository;
+    private final CategoryRepository categoryRepository;
+    private final UserRepository userRepository;
+    private final FileStorageService fileStorageService;
+    private final ProducerNotificationService producerNotificationService;
+    private final StockReservationRepository stockReservationRepository;
+    private final ReviewRepository reviewRepository;
+    private final AdminNotificationService adminNotificationService;
+    private final OrderItemRepository orderItemRepository;
+    private static final int LOW_STOCK_THRESHOLD = 10;
+    private static final int CRITICAL_STOCK_THRESHOLD = 5;
+    private static final int MAX_TITLE_LENGTH = 255;
+    private static final int MAX_DESCRIPTION_LENGTH = 255;
+
+    @ProducerOnly
+    public ProductResponse createProduct(ProductRequest request, MultipartFile[] images, Long producerId) {
+        try {
+            validateProductPrice(request.getPrice());
+            validateQuantity(request.getQuantity(), true);
+            
+            Product product = new Product();
+            product.setName(resolveTitle(request));
+            product.setDescription(resolveDescription(request));
+            product.setPrice(request.getPrice());
+            product.setQuantity(request.getQuantity());
+            product.setCondition(request.getCondition() == null ? ListingCondition.GOOD : request.getCondition());
+            product.setListingStatus(request.getListingStatus() == null ? ListingStatus.ACTIVE : request.getListingStatus());
+            replaceImages(product, request, images, true);
+
+            User producer = userRepository.findById(producerId)
+                .orElseThrow(() -> new ApiException(ErrorType.RESOURCE_NOT_FOUND, "Producer not found"));
+            product.setProducer(producer);
+
+            if (request.getCategoryIds() != null && !request.getCategoryIds().isEmpty()) {
+                Set<Category> categories = categoryRepository.findAllById(request.getCategoryIds())
+                    .stream().collect(Collectors.toSet());
+                if (categories.size() != request.getCategoryIds().size()) {
+                    throw new ApiException(ErrorType.RESOURCE_NOT_FOUND, "One or more categories not found");
+                }
+                product.setCategories(categories);
+            }
+
+            product.setStatus(ProductStatus.PENDING);
+            Product savedProduct = productRepository.save(product);
+
+            adminNotificationService.notifyNewProductNeedsReview(savedProduct);
+
+            return convertToDTO(savedProduct);
+        } catch (DataIntegrityViolationException e) {
+            throw new ApiException(ErrorType.DUPLICATE_RESOURCE, "Product with similar details already exists");
+        }
+    }
+
+    @ProducerOnly
+    @Transactional
+    public ProductResponse updateProduct(Long id, ProductRequest request, MultipartFile[] images, Long producerId) {
+        validateProductPrice(request.getPrice());
+        validateQuantity(request.getQuantity(), false);
+        Product product = productRepository.findById(id)
+            .orElseThrow(() -> new ApiException(ErrorType.PRODUCT_NOT_FOUND, "Product not found"));
+            
+        if (!product.getProducer().getUserId().equals(producerId)) {
+            throw new ApiException(ErrorType.PRODUCT_ACCESS_DENIED, "You can only update your own products");
+        }
+
+        product.setName(resolveTitle(request));
+        product.setDescription(resolveDescription(request));
+        product.setPrice(request.getPrice());
+        product.setQuantity(request.getQuantity());
+        if (request.getCondition() != null) {
+            product.setCondition(request.getCondition());
+        }
+        if (request.getListingStatus() != null) {
+            product.setListingStatus(request.getListingStatus());
+        }
+        if (request.getQuantity() == 0) {
+            product.setListingStatus(ListingStatus.SOLD);
+        }
+        replaceImages(product, request, images, false);
+
+        if (request.getCategoryIds() != null) {
+            Set<Category> categories = categoryRepository.findAllById(request.getCategoryIds())
+                .stream().collect(Collectors.toSet());
+            if (categories.size() != request.getCategoryIds().size()) {
+                throw new ApiException(ErrorType.RESOURCE_NOT_FOUND, "One or more categories not found");
+            }
+            product.setCategories(categories);
+        }
+
+        product.setStatus(ProductStatus.PENDING);
+
+        return convertToDTO(productRepository.save(product));
+    }
+
+    @Transactional
+    public void deleteProductAsAdmin(Long id) {
+        Product product = productRepository.findById(id)
+            .orElseThrow(() -> new ApiException(ErrorType.PRODUCT_NOT_FOUND, "Product not found"));
+        deleteOrArchive(product);
+    }
+
+    @ProducerOnly
+    @Transactional
+    public void deleteProduct(Long id, Long producerId) {
+        Product product = productRepository.findById(id)
+            .orElseThrow(() -> new ApiException(ErrorType.PRODUCT_NOT_FOUND, "Product not found"));
+            
+        if (!product.getProducer().getUserId().equals(producerId)) {
+            throw new ApiException(ErrorType.PRODUCT_ACCESS_DENIED, "You can only delete your own products");
+        }
+
+        deleteOrArchive(product);
+    }
+
+    private void deleteOrArchive(Product product) {
+        if (orderItemRepository.existsByProductProductId(product.getProductId())) {
+            product.setListingStatus(ListingStatus.ARCHIVED);
+            productRepository.save(product);
+            return;
+        }
+
+        List<String> storedImages = new ArrayList<>(getImageUrls(product));
+        productRepository.delete(product);
+        productRepository.flush();
+        for (String image : storedImages) {
+            if (productRepository.countByImageReference(image) == 0) {
+                TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                    @Override
+                    public void afterCommit() {
+                        try {
+                            fileStorageService.deleteLocalFile(image);
+                        } catch (ApiException cleanupFailure) {
+                            log.warn("Deleted listing but could not clean up local image {}: {}",
+                                image, cleanupFailure.getMessage());
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    private ProductResponse convertToDTO(Product product) {
+        User producer = product.getProducer();
+        FilterUsersResponse producerDTO = new FilterUsersResponse(
+            producer.getUserId(),
+            producer.getUsername(),
+            producer.getEmail(),
+            producer.getFirstname(),
+            producer.getLastname()
+        );
+        
+        List<VerifiedReviews> verifiedReviews = reviewRepository.findByProductProductId(product.getProductId())
+            .stream()
+            .filter(review -> review.isVerifiedPurchase() && review.getStatus() == ReviewStatus.APPROVED)
+            .map((Review review) -> VerifiedReviews.builder()
+                .reviewId(review.getReviewId())
+                .customerUsername(review.getCustomer().getUsername())
+                .rating(review.getRating())
+                .comment(review.getComment())
+                .verifiedPurchase(review.isVerifiedPurchase())
+                .createdAt(review.getCreatedAt())
+                .build())
+            .collect(Collectors.toList());
+
+        ProductResponse response = new ProductResponse();
+        response.setProductId(product.getProductId());
+        response.setTitle(product.getName());
+        response.setName(product.getName());
+        response.setDescription(product.getDescription());
+        response.setPrice(product.getPrice());
+        response.setQuantity(product.getQuantity());
+        response.setImageUrl(product.getImageUrl());
+        response.setImages(getImageUrls(product));
+        response.setCreatedAt(product.getCreatedAt());
+        response.setUpdatedAt(product.getUpdatedAt());
+        response.setCategories(product.getCategories());
+        response.setProducer(producerDTO);
+        response.setSeller(producerDTO);
+        response.setVerifiedReviews(verifiedReviews);
+        response.setStock(product.getQuantity() > 0 && effectiveListingStatus(product) != ListingStatus.SOLD);
+        response.setCondition(effectiveCondition(product));
+        response.setListingStatus(effectiveListingStatus(product));
+        
+        return response;
+    }
+
+    @Transactional(readOnly = true)
+    public Page<ProducerProductsResponse> getAllProductsGroupedByProducer(
+            Pageable pageable,
+            String searchTerm,
+            ListingCondition condition,
+            BigDecimal minPrice,
+            BigDecimal maxPrice) {
+        validatePriceRange(minPrice, maxPrice);
+        List<Product> allProducts = productRepository.findAllWithCategories();
+        
+        // Filter for APPROVED products only and apply search if term provided
+        List<Product> filteredProducts = allProducts.stream()
+            .filter(product -> product.getStatus() == ProductStatus.APPROVED)
+            .filter(product -> effectiveListingStatus(product) == ListingStatus.ACTIVE)
+            .filter(product -> matchesSearch(product, searchTerm))
+            .filter(product -> condition == null || effectiveCondition(product) == condition)
+            .filter(product -> matchesPriceRange(product, minPrice, maxPrice))
+            .collect(Collectors.toList());
+        
+        // Sort all products first
+        List<Product> sortedProducts = filteredProducts.stream()
+            .sorted((p1, p2) -> {
+                if (pageable.getSort().isEmpty()) {
+                    return 0;
+                }
+                String sortBy = pageable.getSort().iterator().next().getProperty();
+                boolean isAsc = pageable.getSort().iterator().next().isAscending();
+                
+                int comparison = switch(sortBy) {
+                    case "price" -> p1.getPrice().compareTo(p2.getPrice());
+                    case "name" -> p1.getName().compareTo(p2.getName());
+                    case "quantity" -> Integer.compare(p1.getQuantity(), p2.getQuantity());
+                    case "updatedAt" -> p1.getUpdatedAt().compareTo(p2.getUpdatedAt());
+                    case "createdAt" -> p1.getCreatedAt().compareTo(p2.getCreatedAt());
+                    default -> 0;
+                };
+                return isAsc ? comparison : -comparison;
+            })
+            .collect(Collectors.toList());
+
+        // Apply pagination
+        int start = (int) pageable.getOffset();
+        int end = Math.min((start + pageable.getPageSize()), sortedProducts.size());
+        
+        if (start >= sortedProducts.size()) {
+            return new PageImpl<>(List.of(), pageable, sortedProducts.size());
+        }
+        
+        List<Product> paginatedProducts = sortedProducts.subList(start, end);
+        
+        // Keep the legacy seller wrapper while returning one wrapper per listing.
+        // This makes Page totals and page sizes represent listings, not seller groups.
+        List<ProducerProductsResponse> responses = paginatedProducts.stream()
+            .map(this::toProducerProductResponse)
+            .collect(Collectors.toList());
+            
+        return new PageImpl<>(responses, pageable, sortedProducts.size());
+    }
+
+    @Transactional(readOnly = true)
+    public Optional<ProductResponse> getProductByIdWithCategories(Long id) {
+        return productRepository.findByIdWithCategories(id)
+            .filter(product -> product.getStatus() == ProductStatus.APPROVED)
+            .map(this::convertToDTO);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<ProducerProductsResponse> getProductsByCategory(
+            Long categoryId,
+            Pageable pageable,
+            String searchTerm,
+            ListingCondition condition,
+            BigDecimal minPrice,
+            BigDecimal maxPrice) {
+        validatePriceRange(minPrice, maxPrice);
+        if (!categoryRepository.existsById(categoryId)) {
+            throw new ApiException(ErrorType.CATEGORY_NOT_FOUND, 
+                "Category with id " + categoryId + " not found");
+        }
+        
+        List<Product> products = productRepository.findByCategoriesCategoryId(categoryId);
+        
+        // Filter for APPROVED products only
+        List<Product> approvedProducts = products.stream()
+            .filter(product -> product.getStatus() == ProductStatus.APPROVED)
+            .filter(product -> effectiveListingStatus(product) == ListingStatus.ACTIVE)
+            .filter(product -> matchesSearch(product, searchTerm))
+            .filter(product -> condition == null || effectiveCondition(product) == condition)
+            .filter(product -> matchesPriceRange(product, minPrice, maxPrice))
+            .collect(Collectors.toList());
+        
+        // Sort products by the requested field
+        List<Product> sortedProducts = approvedProducts.stream()
+            .sorted((p1, p2) -> {
+                if (pageable.getSort().isEmpty()) {
+                    return 0;
+                }
+                String sortBy = pageable.getSort().iterator().next().getProperty();
+                boolean isAsc = pageable.getSort().iterator().next().isAscending();
+                
+                return switch(sortBy) {
+                    case "price" -> isAsc ? 
+                        p1.getPrice().compareTo(p2.getPrice()) :
+                        p2.getPrice().compareTo(p1.getPrice());
+                    case "name" -> isAsc ? 
+                        p1.getName().compareTo(p2.getName()) :
+                        p2.getName().compareTo(p1.getName());
+                    case "quantity" -> isAsc ? 
+                        Integer.compare(p1.getQuantity(), p2.getQuantity()) :
+                        Integer.compare(p2.getQuantity(), p1.getQuantity());
+                    case "updatedAt" -> isAsc ? 
+                        p1.getUpdatedAt().compareTo(p2.getUpdatedAt()) :
+                        p2.getUpdatedAt().compareTo(p1.getUpdatedAt());
+                    case "createdAt" -> isAsc ? 
+                        p1.getCreatedAt().compareTo(p2.getCreatedAt()) :
+                        p2.getCreatedAt().compareTo(p1.getCreatedAt());
+                    default -> 0;
+                };
+            })
+            .collect(Collectors.toList());
+            
+        // Apply pagination
+        int start = (int) pageable.getOffset();
+        int end = Math.min((start + pageable.getPageSize()), sortedProducts.size());
+        
+        if (start >= sortedProducts.size()) {
+            return new PageImpl<>(List.of(), pageable, sortedProducts.size());
+        }
+        
+        List<Product> paginatedProducts = sortedProducts.subList(start, end);
+        
+        List<ProducerProductsResponse> responses = paginatedProducts.stream()
+            .map(this::toProducerProductResponse)
+            .collect(Collectors.toList());
+            
+        return new PageImpl<>(responses, pageable, sortedProducts.size());
+    }
+
+    private void validateProductPrice(BigDecimal price) {
+        if (price == null || price.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new ApiException(ErrorType.INVALID_PRODUCT_PRICE, 
+                "Product price must be greater than 0");
+        }
+        
+        if (price.compareTo(new BigDecimal("999999.99")) > 0) {
+            throw new ApiException(ErrorType.INVALID_PRODUCT_PRICE, 
+                "Product price cannot exceed 999999.99");
+        }
+        
+        if (price.scale() > 2) {
+            throw new ApiException(ErrorType.INVALID_PRODUCT_PRICE, 
+                "Product price cannot have more than 2 decimal places");
+        }
+    }
+
+    @Transactional(readOnly = true)
+    public List<ProducerProductsResponse> getProductsByStatus(ProductStatus status) {
+        List<Product> products = productRepository.findByStatus(status);
+        
+        // Group by producer
+        Map<User, List<Product>> groupedProducts = products.stream()
+            .collect(Collectors.groupingBy(Product::getProducer));
+
+        return groupedProducts.entrySet().stream()
+            .map(entry -> new ProducerProductsResponse(
+                entry.getKey().getUserId(),
+                entry.getKey().getUsername(),
+                entry.getKey().getFirstname(),
+                entry.getKey().getLastname(),
+                entry.getKey().getEmail(),
+                entry.getValue().stream()
+                    .map(this::convertToDTO)
+                    .collect(Collectors.toList())
+            ))
+            .collect(Collectors.toList());
+    }
+
+    @Transactional(readOnly = true)
+    public Page<ProducerProductsResponse> getProductsByStatus(ProductStatus status, Pageable pageable) {
+        List<Product> products = productRepository.findByStatus(status);
+        
+        // Sort products
+        List<Product> sortedProducts = products.stream()
+            .sorted((p1, p2) -> {
+                if (pageable.getSort().isEmpty()) {
+                    return 0;
+                }
+                String sortBy = pageable.getSort().iterator().next().getProperty();
+                boolean isAsc = pageable.getSort().iterator().next().isAscending();
+                
+                int comparison = switch(sortBy) {
+                    case "price" -> p1.getPrice().compareTo(p2.getPrice());
+                    case "name" -> p1.getName().compareTo(p2.getName());
+                    case "createdAt" -> p1.getCreatedAt().compareTo(p2.getCreatedAt());
+                    default -> 0;
+                };
+                return isAsc ? comparison : -comparison;
+            })
+            .collect(Collectors.toList());
+        
+        // Apply pagination
+        int start = (int) pageable.getOffset();
+        int end = Math.min((start + pageable.getPageSize()), sortedProducts.size());
+        
+        if (start >= sortedProducts.size()) {
+            return new PageImpl<>(List.of(), pageable, sortedProducts.size());
+        }
+        
+        List<Product> paginatedProducts = sortedProducts.subList(start, end);
+        
+        // Group by producer
+        Map<User, List<Product>> groupedProducts = paginatedProducts.stream()
+            .collect(Collectors.groupingBy(Product::getProducer));
+
+        List<ProducerProductsResponse> responses = groupedProducts.entrySet().stream()
+            .map(entry -> new ProducerProductsResponse(
+                entry.getKey().getUserId(),
+                entry.getKey().getUsername(),
+                entry.getKey().getFirstname(),
+                entry.getKey().getLastname(),
+                entry.getKey().getEmail(),
+                entry.getValue().stream()
+                    .map(this::convertToDTO)
+                    .collect(Collectors.toList())
+            ))
+            .collect(Collectors.toList());
+            
+        return new PageImpl<>(responses, pageable, sortedProducts.size());
+    }
+
+    @Transactional(readOnly = true)
+    public List<ProductResponse> getProducerProductsByStatus(Long producerId, ProductStatus status) {
+        return productRepository.findByProducerUserIdAndStatus(producerId, status)
+            .stream()
+            .map(this::convertToDTO)
+            .collect(Collectors.toList());
+    }
+
+    @Transactional
+    public ProductResponse updateProductStatus(Long productId, ProductStatus status, String declineReason) {
+        Product product = productRepository.findById(productId)
+            .orElseThrow(() -> new ApiException(ErrorType.PRODUCT_NOT_FOUND, "Product not found"));
+            
+        if (status == ProductStatus.DECLINED && (declineReason == null || declineReason.trim().isEmpty())) {
+            throw new ApiException(ErrorType.INVALID_REQUEST, "Decline reason is required");
+        }
+        
+        product.setStatus(status);
+        product.setDeclineReason(declineReason);
+
+        switch (status) {
+            case APPROVED:
+                producerNotificationService.notifyProductApproval(product.getProducer().getUserId(), product, true, null);
+                break;
+            case DECLINED:
+                producerNotificationService.notifyProductApproval(product.getProducer().getUserId(), product, false, declineReason);
+                break;
+            default:
+                break;
+        }
+
+        return convertToDTO(productRepository.save(product));
+    }
+
+    private MyProductResponse convertToMyProductDTO(Product product) {
+        MyProductResponse response = new MyProductResponse();
+        response.setProductId(product.getProductId());
+        response.setTitle(product.getName());
+        response.setName(product.getName());
+        response.setDescription(product.getDescription());
+        response.setPrice(product.getPrice());
+        response.setQuantity(product.getQuantity());
+        response.setImageUrl(product.getImageUrl());
+        response.setImages(getImageUrls(product));
+        response.setCreatedAt(product.getCreatedAt());
+        response.setUpdatedAt(product.getUpdatedAt());
+        response.setCategories(product.getCategories());
+        response.setStatus(product.getStatus());
+        response.setDeclineReason(product.getDeclineReason());
+        response.setCondition(effectiveCondition(product));
+        response.setListingStatus(effectiveListingStatus(product));
+        response.setStock(product.getQuantity() > 0 && effectiveListingStatus(product) != ListingStatus.SOLD);
+        return response;
+    }
+
+    private void validateQuantity(Integer quantity, boolean creating) {
+        if (quantity == null || quantity < (creating ? 1 : 0)) {
+            throw new ApiException(ErrorType.VALIDATION_FAILED,
+                creating ? "Listing quantity must be at least 1" : "Listing quantity cannot be negative");
+        }
+    }
+
+    private ProducerProductsResponse toProducerProductResponse(Product product) {
+        User seller = product.getProducer();
+        return new ProducerProductsResponse(
+            seller.getUserId(),
+            seller.getUsername(),
+            seller.getFirstname(),
+            seller.getLastname(),
+            seller.getEmail(),
+            List.of(convertToDTO(product))
+        );
+    }
+
+    @Transactional(readOnly = true)
+    public MyProductResponse getProducerProduct(Long productId, Long producerId) {
+        Product product = productRepository.findByIdWithCategories(productId)
+            .orElseThrow(() -> new ApiException(ErrorType.PRODUCT_NOT_FOUND, "Product not found"));
+        if (!product.getProducer().getUserId().equals(producerId)) {
+            throw new ApiException(ErrorType.PRODUCT_ACCESS_DENIED, "You can only access your own listings");
+        }
+        return convertToMyProductDTO(product);
+    }
+
+    private String resolveTitle(ProductRequest request) {
+        String title = request.getTitle() != null ? request.getTitle() : request.getName();
+        if (title == null || title.trim().length() < 2) {
+            throw new ApiException(ErrorType.INVALID_REQUEST, "Listing title must be at least 2 characters");
+        }
+        String trimmed = title.trim();
+        if (trimmed.length() > MAX_TITLE_LENGTH) {
+            throw new ApiException(ErrorType.INVALID_REQUEST,
+                "Listing title cannot exceed " + MAX_TITLE_LENGTH + " characters");
+        }
+        return trimmed;
+    }
+
+    private String resolveDescription(ProductRequest request) {
+        String description = request.getDescription();
+        if (description == null || description.trim().isEmpty()) {
+            throw new ApiException(ErrorType.INVALID_REQUEST, "Listing description is required");
+        }
+        String trimmed = description.trim();
+        if (trimmed.length() > MAX_DESCRIPTION_LENGTH) {
+            throw new ApiException(ErrorType.INVALID_REQUEST,
+                "Listing description cannot exceed " + MAX_DESCRIPTION_LENGTH + " characters");
+        }
+        return trimmed;
+    }
+
+    private void replaceImages(
+        Product product,
+        ProductRequest request,
+        MultipartFile[] uploadedImages,
+        boolean required
+    ) {
+        boolean explicitSelection = request.getImages() != null;
+        if (!required && explicitSelection) {
+            List<String> currentImages = getImageUrls(product);
+            if (request.getImages().stream().anyMatch(url -> !currentImages.contains(url))) {
+                throw new ApiException(ErrorType.INVALID_REQUEST,
+                    "Only images already on this listing can be retained");
+            }
+        }
+
+        List<String> imageUrls = new ArrayList<>();
+        if (explicitSelection) {
+            request.getImages().stream()
+                .filter(url -> url != null && !url.isBlank())
+                .map(String::trim)
+                .peek(url -> {
+                    if (required) {
+                        validateRemoteImageUrl(url);
+                    }
+                })
+                .forEach(imageUrls::add);
+        }
+        long uploadCount = uploadedImages == null ? 0 : Arrays.stream(uploadedImages)
+            .filter(image -> image != null && !image.isEmpty())
+            .count();
+        long remoteCount = request.getImageUrl() != null && !request.getImageUrl().isBlank() ? 1 : 0;
+        if (imageUrls.size() + uploadCount + remoteCount > 8) {
+            throw new ApiException(ErrorType.INVALID_FILE, "A listing can have at most 8 images");
+        }
+        if (uploadedImages != null) {
+            for (MultipartFile image : uploadedImages) {
+                if (image != null && !image.isEmpty()) {
+                    imageUrls.add(fileStorageService.storeFile(image));
+                }
+            }
+        }
+        if (request.getImageUrl() != null && !request.getImageUrl().isBlank()) {
+            imageUrls.add(validateRemoteImageUrl(request.getImageUrl()));
+        }
+
+        List<String> distinctImages = imageUrls.stream().distinct().collect(Collectors.toList());
+        if (distinctImages.size() > 8) {
+            throw new ApiException(ErrorType.INVALID_FILE, "A listing can have at most 8 images");
+        }
+        if (!distinctImages.isEmpty()) {
+            product.getImages().clear();
+            product.getImages().addAll(distinctImages);
+            product.setImageUrl(distinctImages.get(0));
+        } else if (required || explicitSelection) {
+            throw new ApiException(ErrorType.INVALID_REQUEST, "At least one listing image is required");
+        }
+    }
+
+    private String validateRemoteImageUrl(String rawUrl) {
+        String value = rawUrl.trim();
+        try {
+            URI uri = new URI(value);
+            if (!"https".equalsIgnoreCase(uri.getScheme())
+                || uri.getHost() == null
+                || uri.getUserInfo() != null) {
+                throw new ApiException(ErrorType.INVALID_FILE,
+                    "Remote listing images must use a valid HTTPS URL");
+            }
+            return value;
+        } catch (URISyntaxException exception) {
+            throw new ApiException(ErrorType.INVALID_FILE,
+                "Remote listing images must use a valid HTTPS URL");
+        }
+    }
+
+    private List<String> getImageUrls(Product product) {
+        if (product.getImages() != null && !product.getImages().isEmpty()) {
+            return List.copyOf(product.getImages());
+        }
+        if (product.getImageUrl() != null && !product.getImageUrl().isBlank()) {
+            return List.of(product.getImageUrl());
+        }
+        return List.of();
+    }
+
+    private ListingCondition effectiveCondition(Product product) {
+        return product.getCondition() == null ? ListingCondition.GOOD : product.getCondition();
+    }
+
+    private ListingStatus effectiveListingStatus(Product product) {
+        return product.getListingStatus() == null ? ListingStatus.ACTIVE : product.getListingStatus();
+    }
+
+    private boolean matchesSearch(Product product, String searchTerm) {
+        if (searchTerm == null || searchTerm.isBlank()) {
+            return true;
+        }
+        String search = searchTerm.trim().toLowerCase();
+        return product.getName().toLowerCase().contains(search)
+            || (product.getDescription() != null && product.getDescription().toLowerCase().contains(search));
+    }
+
+    private boolean matchesPriceRange(Product product, BigDecimal minPrice, BigDecimal maxPrice) {
+        return (minPrice == null || product.getPrice().compareTo(minPrice) >= 0)
+            && (maxPrice == null || product.getPrice().compareTo(maxPrice) <= 0);
+    }
+
+    private void validatePriceRange(BigDecimal minPrice, BigDecimal maxPrice) {
+        if (minPrice != null && minPrice.compareTo(BigDecimal.ZERO) < 0) {
+            throw new ApiException(ErrorType.INVALID_REQUEST, "Minimum price cannot be negative");
+        }
+        if (maxPrice != null && maxPrice.compareTo(BigDecimal.ZERO) < 0) {
+            throw new ApiException(ErrorType.INVALID_REQUEST, "Maximum price cannot be negative");
+        }
+        if (minPrice != null && maxPrice != null && minPrice.compareTo(maxPrice) > 0) {
+            throw new ApiException(ErrorType.INVALID_REQUEST, "Minimum price cannot exceed maximum price");
+        }
+    }
+
+    @Transactional(readOnly = true)
+    public Page<MyProductResponse> getProducerProducts(Long producerId, Pageable pageable) {
+        List<Product> products = productRepository.findByProducerUserId(producerId);
+        
+        // Sort products
+        List<Product> sortedProducts = products.stream()
+            .sorted((p1, p2) -> {
+                if (pageable.getSort().isEmpty()) {
+                    return 0;
+                }
+                String sortBy = pageable.getSort().iterator().next().getProperty();
+                boolean isAsc = pageable.getSort().iterator().next().isAscending();
+                
+                int comparison = switch(sortBy) {
+                    case "createdAt" -> p1.getCreatedAt().compareTo(p2.getCreatedAt());
+                    case "name" -> p1.getName().compareTo(p2.getName());
+                    case "price" -> p1.getPrice().compareTo(p2.getPrice());
+                    case "quantity" -> Integer.compare(p1.getQuantity(), p2.getQuantity());
+                    case "status" -> p1.getStatus().compareTo(p2.getStatus());
+                    default -> 0;
+                };
+                return isAsc ? comparison : -comparison;
+            })
+            .collect(Collectors.toList());
+            
+        // Apply pagination
+        int start = (int) pageable.getOffset();
+        int end = Math.min((start + pageable.getPageSize()), sortedProducts.size());
+        
+        if (start >= sortedProducts.size()) {
+            return new PageImpl<>(List.of(), pageable, sortedProducts.size());
+        }
+        
+        List<Product> paginatedProducts = sortedProducts.subList(start, end);
+        
+        return new PageImpl<>(
+            paginatedProducts.stream()
+                .map(this::convertToMyProductDTO)
+                .collect(Collectors.toList()),
+            pageable,
+            sortedProducts.size()
+        );
+    }
+
+    @Transactional(readOnly = true)
+    public Page<MyProductResponse> getProducerPendingAndDeclinedProducts(Long producerId, Pageable pageable) {
+        List<Product> products = productRepository.findByProducerUserIdAndStatusIn(
+                producerId, 
+                List.of(ProductStatus.PENDING, ProductStatus.DECLINED));
+                
+        // Sort products
+        List<Product> sortedProducts = products.stream()
+            .sorted((p1, p2) -> {
+                if (pageable.getSort().isEmpty()) {
+                    return 0;
+                }
+                String sortBy = pageable.getSort().iterator().next().getProperty();
+                boolean isAsc = pageable.getSort().iterator().next().isAscending();
+                
+                int comparison = switch(sortBy) {
+                    case "createdAt" -> p1.getCreatedAt().compareTo(p2.getCreatedAt());
+                    case "name" -> p1.getName().compareTo(p2.getName());
+                    case "price" -> p1.getPrice().compareTo(p2.getPrice());
+                    case "quantity" -> Integer.compare(p1.getQuantity(), p2.getQuantity());
+                    case "status" -> p1.getStatus().compareTo(p2.getStatus());
+                    default -> 0;
+                };
+                return isAsc ? comparison : -comparison;
+            })
+            .collect(Collectors.toList());
+            
+        // Apply pagination
+        int start = (int) pageable.getOffset();
+        int end = Math.min((start + pageable.getPageSize()), sortedProducts.size());
+        
+        if (start >= sortedProducts.size()) {
+            return new PageImpl<>(List.of(), pageable, sortedProducts.size());
+        }
+        
+        List<Product> paginatedProducts = sortedProducts.subList(start, end);
+        
+        return new PageImpl<>(
+            paginatedProducts.stream()
+                .map(this::convertToMyProductDTO)
+                .collect(Collectors.toList()),
+            pageable,
+            sortedProducts.size()
+        );
+    }
+
+
+    @Scheduled(fixedRate = 3600000) // Run every hour
+    @Transactional
+    public void monitorStockLevels() {
+        List<Product> products = productRepository.findAll();
+        
+        for (Product product : products) {
+            int availableStock = getAvailableStock(product);
+            int reservedStock = getReservedStock(product);
+            int totalStock = availableStock + reservedStock;
+            
+            // Critical stock notification
+            if (availableStock <= CRITICAL_STOCK_THRESHOLD) {
+                NotificationResponse notification = NotificationResponse.builder()
+                    .type("CRITICAL_STOCK_ALERT")
+                    .message("CRITICAL ALERT: " + product.getName() + " stock is critically low!")
+                    .data(Map.of(
+                        "productId", product.getProductId(),
+                        "productName", product.getName(),
+                        "availableStock", availableStock,
+                        "reservedStock", reservedStock,
+                        "totalStock", totalStock
+                    ))
+                    .timestamp(LocalDateTime.now())
+                    .read(false)
+                    .build();
+                
+                producerNotificationService.sendToUser(
+                    product.getProducer().getUserId(),
+                    notification
+                );
+            }
+            // Low stock notification
+            else if (availableStock <= LOW_STOCK_THRESHOLD) {
+                NotificationResponse notification = NotificationResponse.builder()
+                    .type("LOW_STOCK_ALERT")
+                    .message("Alert: " + product.getName() + " stock is running low")
+                    .data(Map.of(
+                        "productId", product.getProductId(),
+                        "productName", product.getName(),
+                        "availableStock", availableStock,
+                        "reservedStock", reservedStock,
+                        "totalStock", totalStock
+                    ))
+                    .timestamp(LocalDateTime.now())
+                    .read(false)
+                    .build();
+                
+                producerNotificationService.sendToUser(
+                    product.getProducer().getUserId(),
+                    notification
+                );
+            }
+            
+            // Stock movement notification (when reserved stock changes)
+            if (reservedStock > 0) {
+                NotificationResponse notification = NotificationResponse.builder()
+                    .type("STOCK_MOVEMENT")
+                    .message("Stock movement detected for " + product.getName())
+                    .data(Map.of(
+                        "productId", product.getProductId(),
+                        "productName", product.getName(),
+                        "availableStock", availableStock,
+                        "reservedStock", reservedStock,
+                        "totalStock", totalStock
+                    ))
+                    .timestamp(LocalDateTime.now())
+                    .read(false)
+                    .build();
+                
+                producerNotificationService.sendToUser(
+                    product.getProducer().getUserId(),
+                    notification
+                );
+            }
+        }
+    }
+
+    private int getReservedStock(Product product) {
+        LocalDateTime now = LocalDateTime.now();
+        return stockReservationRepository
+            .findByProductAndExpiresAtGreaterThan(product, now)
+            .stream()
+            .mapToInt(StockReservation::getQuantity)
+            .sum();
+    }
+
+    @Transactional
+    public void confirmStockReduction(Order order) {
+        for (OrderItem item : order.getItems()) {
+            Product product = item.getProduct();
+            int newQuantity = product.getQuantity() - item.getQuantity();
+            product.setQuantity(newQuantity);
+            
+            NotificationResponse notification = NotificationResponse.builder()
+                .type("STOCK_UPDATED")
+                .message("Stock reduced for " + product.getName())
+                .data(Map.of(
+                    "productId", product.getProductId(),
+                    "productName", product.getName(),
+                    "previousQuantity", product.getQuantity(),
+                    "newQuantity", newQuantity,
+                    "reduction", item.getQuantity(),
+                    "orderId", order.getOrderId()
+                ))
+                .timestamp(LocalDateTime.now())
+                .read(false)
+                .build();
+            
+            producerNotificationService.sendToUser(
+                product.getProducer().getUserId(),
+                notification
+            );
+            
+            productRepository.save(product);
+        }
+        stockReservationRepository.deleteByOrder(order);
+    }
+
+    @Transactional
+    public void reserveStock(Order order) {
+        for (OrderItem item : order.getItems()) {
+            Product product = item.getProduct();
+            int availableStock = getAvailableStock(product);
+            
+            if (availableStock < item.getQuantity()) {
+                throw new ApiException(ErrorType.INSUFFICIENT_STOCK, 
+                    "Insufficient stock for product: " + product.getName());
+            }
+            
+            StockReservation reservation = new StockReservation();
+            reservation.setProduct(product);
+            reservation.setOrder(order);
+            reservation.setQuantity(item.getQuantity());
+            stockReservationRepository.save(reservation);
+        }
+    }
+
+    @Transactional
+    public void releaseStock(Order order) {
+        stockReservationRepository.deleteByOrder(order);
+    }
+
+    public int getAvailableStock(Product product) {
+        LocalDateTime now = LocalDateTime.now();
+        List<StockReservation> activeReservations = 
+            stockReservationRepository.findByProductAndExpiresAtGreaterThan(product, now);
+            
+        int reservedQuantity = activeReservations.stream()
+            .mapToInt(StockReservation::getQuantity)
+            .sum();
+            
+        return product.getQuantity() - reservedQuantity;
+    }
+} 
